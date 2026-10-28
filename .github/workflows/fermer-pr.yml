@@ -1,0 +1,16 @@
+name: Fermer les pull requests
+on:
+  pull_request_target:
+    types: [opened, reopened]
+permissions:
+  pull-requests: write
+jobs:
+  fermer:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh pr close "$PR" --repo "$REPO" --comment "$MSG"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          MSG: "Merci ! Ce dépôt est un miroir et je n'accepte pas de pull requests. Pour signaler un problème, ouvre plutôt une issue. / This repository is a mirror: pull requests are not accepted, please open an issue instead."
