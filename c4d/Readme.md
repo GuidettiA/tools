@@ -48,6 +48,8 @@ Traite en masse un dossier de fichiers `.usdz` : nettoyage de la hiérarchie (lo
 
 **GUI** : ouvrir C4D normalement → Script Manager → ouvrir `usdz_pipeline.py` → Execute. La popup de choix du dossier s'affiche automatiquement.
 
+> **Rendu d'aperçu = GUI uniquement.** En headless (`c4dpy`, donc aussi via `run_batch.ps1`), aucun `.png` n'est produit : pas de viewport à cadrer. Pour les aperçus, passer par le Script Manager.
+
 **Headless via l'orchestrateur** (recommandé pour un lot complet) :
 ```powershell
 powershell -ExecutionPolicy Bypass -File "tools\c4d\shell\run_batch.ps1"
@@ -65,9 +67,29 @@ Pour tester sur un seul fichier ou un dossier sans passer par l'orchestrateur :
 & "C:\Program Files\Maxon Cinema 4D 2026\c4dpy.exe" "tools\c4d\python\pipeline\usdz_pipeline.py" "chemin\vers\dossier"
 ```
 
+**Depuis un PowerShell administrateur** : une session élevée ne voit pas les lecteurs réseau (`Z:`, `Y:`…) montés par la session normale — `Z:\tools\...` y est introuvable. Utiliser le chemin UNC complet, pour le script comme pour les dossiers demandés ensuite :
+```powershell
+powershell -ExecutionPolicy Bypass -File "\\192.168.1.20\shared\tools\c4d\shell\run_batch.ps1"
+```
+Ou lancer depuis un PowerShell non élevé, où `Z:\` fonctionne normalement. Même limite en SSH : la session ne reconnecte pas les lecteurs mémorisés (état « Non disponible » dans `net use`) faute d'identifiants Samba.
+
 ### Configuration
 
-Seule la constante `FBX_EXPORT_ID` en tête de `usdz_pipeline.py` est à revérifier après une mise à jour majeure de C4D.
+- `FBX_EXPORT_ID` en tête de `usdz_pipeline.py` : à revérifier après une mise à jour majeure de C4D.
+- `DELETE_INTERMEDIATE_FILES` : passer à `False` pour lister sans supprimer les fichiers intermédiaires signalés par C4D (utile pour diagnostiquer des textures manquantes).
+
+### Matériaux et textures
+
+> **Utiliser Cinema 4D 2026, pas 2027 (GUI comme headless).** L'importeur USD de C4D 2027 échoue sur les UV des meshes : `Illegal state: UV indices invalid [ousd-import-mesh.cpp(112)]` (popup en GUI, ligne de log en headless).
+>
+> - **Conséquence** : aucune géométrie n'est créée. Seule la hiérarchie des groupes USD arrive, sous forme de Nulls vides ; les matériaux sont créés mais assignés à rien (`[DIAG] … 0 tag(s) matériau après import`).
+> - **Piège** : le script ne plante pas et affiche `[OK]`, mais comme le nettoyage supprime les Nulls, les `.c4d` et `.fbx` produits sont **vides**. Tout lot traité en 2027 est à supprimer et relancer en 2026.
+> - **Fichiers concernés** : constaté (novembre 2026) sur des USDZ Sketchfab convertis depuis du glTF (hiérarchie `Sketchfab_model` / `GLTF_SceneRootNode`). Les mêmes fichiers passent sans erreur en 2026 : régression de l'importeur 2027, pas un problème des fichiers.
+> - **Avant de rebasculer sur une version 2027.x** : tester un seul fichier en GUI ; pas de popup UV et des objets polygonaux (pas seulement des Nulls) dans le gestionnaire d'objets = OK.
+
+- Le `.usdz` est ouvert avec `SCENEFILTER_OBJECTS | SCENEFILTER_MATERIALS` (demande explicite des matériaux ; l'ancienne valeur `SCENEFILTER_NONE` fonctionnait aussi en 2026).
+- Le nettoyage de hiérarchie supprime les Nulls ; les tags matériau qu'ils portaient (binding USD sur un Xform) sont recopiés sur la géométrie avant suppression, dans l'ordre d'héritage C4D.
+- Le log contient des lignes `[DIAG]` (nombre de matériaux après import, tags matériau avant/après nettoyage, assets collectés par Save Project with Assets) pour repérer à quelle étape des textures se perdent.
 
 ### Sortie
 

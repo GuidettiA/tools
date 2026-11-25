@@ -183,8 +183,59 @@ def find_root_null_by_name(doc, name):
     return None
 
 
+def _texture_tags(obj):
+    return [t for t in obj.GetTags() if t.GetType() == c4d.Ttexture]
+
+
+def _scan(obj, root_null, inherited, all_geometry, nulls_to_delete):
+    """Parcourt la hiérarchie en mémorisant, pour chaque géométrie, les tags matériau
+    hérités de ses parents (nulls ET géométries parentes, hors root_null).
+
+    Dans un USDZ, le binding matériau est souvent posé sur un Xform (-> Null dans C4D).
+    Quand on aplatit la hiérarchie et qu'on supprime ces Nulls, la géométrie perd
+    son matériau hérité : c'est ce qu'on compense ici."""
+
+    while obj:
+        if obj != root_null:
+            if obj.GetType() != c4d.Onull:
+                all_geometry.append({'obj': obj, 'matrix': obj.GetMg(), 'inherited': list(inherited)})
+            else:
+                nulls_to_delete.append(obj)
+            child_inherited = inherited + _texture_tags(obj)
+        else:
+            child_inherited = inherited
+        _scan(obj.GetDown(), root_null, child_inherited, all_geometry, nulls_to_delete)
+        obj = obj.GetNext()
+
+
+def _flatten_under(doc, root_null, all_geometry, nulls_to_delete):
+    transferred = 0
+    for item in all_geometry:
+        obj = item['obj']
+        doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
+        obj.Remove()
+        obj.InsertUnder(root_null)
+        obj.SetMg(item['matrix'])
+
+        # Ordre C4D : les tags hérités des parents passent AVANT les tags propres de l'objet.
+        # InsertTag(t) sans pred insère en première position -> on insère en ordre inverse
+        # pour obtenir [ancêtre le plus haut, ..., parent direct, tags propres].
+        for tag in reversed(item['inherited']):
+            clone = tag.GetClone()
+            obj.InsertTag(clone)
+            doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, clone)
+            transferred += 1
+
+    for n in reversed(nulls_to_delete):
+        doc.AddUndo(c4d.UNDOTYPE_DELETE, n)
+        n.Remove()
+
+    if transferred:
+        print(f"[MATERIAUX] {transferred} tag(s) matériau hérité(s) recopié(s) sur la géométrie")
+
+
 def clean_usdz(doc):
-    """Portage direct de cleanUSDZ.py."""
+    """Portage de cleanUSDZ.py, avec conservation des matériaux hérités des Nulls supprimés."""
 
     selected_objects = doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
     selected_nulls = [o for o in selected_objects if o.GetType() == c4d.Onull]
@@ -192,37 +243,11 @@ def clean_usdz(doc):
     doc.StartUndo()
     created_root_null = None
 
-    def cleanup_null(root_null):
-        all_geometry = []
-        nulls_to_delete = []
-
-        def scan_hierarchy(obj):
-            while obj:
-                if obj != root_null:
-                    if obj.GetType() != c4d.Onull:
-                        all_geometry.append({'obj': obj, 'matrix': obj.GetMg()})
-                    else:
-                        nulls_to_delete.append(obj)
-                scan_hierarchy(obj.GetDown())
-                obj = obj.GetNext()
-
-        scan_hierarchy(root_null.GetDown())
-
-        for item in all_geometry:
-            obj = item['obj']
-            mg = item['matrix']
-            doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
-            obj.Remove()
-            obj.InsertUnder(root_null)
-            obj.SetMg(mg)
-
-        for n in reversed(nulls_to_delete):
-            doc.AddUndo(c4d.UNDOTYPE_DELETE, n)
-            n.Remove()
-
     if selected_nulls:
         for null in selected_nulls:
-            cleanup_null(null)
+            all_geometry, nulls_to_delete = [], []
+            _scan(null.GetDown(), null, [], all_geometry, nulls_to_delete)
+            _flatten_under(doc, null, all_geometry, nulls_to_delete)
     else:
         doc_name = doc.GetDocumentName()
         clean_name = os.path.splitext(doc_name)[0] or "scene_nettoyee"
@@ -233,36 +258,26 @@ def clean_usdz(doc):
         doc.AddUndo(c4d.UNDOTYPE_NEWOBJ, root_null)
         created_root_null = root_null
 
-        all_geometry = []
-        nulls_to_delete = []
-
-        def scan_scene(obj):
-            while obj:
-                if obj != root_null:
-                    if obj.GetType() != c4d.Onull:
-                        all_geometry.append({'obj': obj, 'matrix': obj.GetMg()})
-                    else:
-                        nulls_to_delete.append(obj)
-                scan_scene(obj.GetDown())
-                obj = obj.GetNext()
-
-        scan_scene(doc.GetFirstObject())
-
-        for item in all_geometry:
-            obj = item['obj']
-            doc.AddUndo(c4d.UNDOTYPE_CHANGE, obj)
-            obj.Remove()
-            obj.InsertUnder(root_null)
-            obj.SetMg(item['matrix'])
-
-        for n in reversed(nulls_to_delete):
-            doc.AddUndo(c4d.UNDOTYPE_DELETE, n)
-            n.Remove()
+        all_geometry, nulls_to_delete = [], []
+        _scan(doc.GetFirstObject(), root_null, [], all_geometry, nulls_to_delete)
+        _flatten_under(doc, root_null, all_geometry, nulls_to_delete)
 
     doc.EndUndo()
     c4d.EventAdd()
 
     return created_root_null
+
+
+def count_texture_tags(doc):
+    n = 0
+    def walk(obj):
+        nonlocal n
+        while obj:
+            n += len(_texture_tags(obj))
+            walk(obj.GetDown())
+            obj = obj.GetNext()
+    walk(doc.GetFirstObject())
+    return n
 
 
 def process_file(usdz_path, output_root, keep_open=False):
@@ -283,7 +298,10 @@ def process_file(usdz_path, output_root, keep_open=False):
 
     shutil.copy2(usdz_path, os.path.join(out_dir, os.path.basename(usdz_path)))
 
-    doc = c4d.documents.LoadDocument(usdz_path, c4d.SCENEFILTER_NONE)
+    # SCENEFILTER_NONE ne demande PAS les matériaux à l'importeur : la géométrie arrive,
+    # mais ni matériaux ni textures. Il faut explicitement OBJECTS | MATERIALS.
+    load_flags = c4d.SCENEFILTER_OBJECTS | c4d.SCENEFILTER_MATERIALS
+    doc = c4d.documents.LoadDocument(usdz_path, load_flags)
     if doc is None:
         print(f"[ERREUR] impossible d'ouvrir {filename}")
         return None
@@ -292,7 +310,13 @@ def process_file(usdz_path, output_root, keep_open=False):
         c4d.documents.InsertBaseDocument(doc)
     c4d.documents.SetActiveDocument(doc)
 
+    n_mats = len(doc.GetMaterials())
+    print(f"[DIAG] {filename} : {n_mats} matériau(x), {count_texture_tags(doc)} tag(s) matériau après import")
+    if n_mats == 0:
+        print(f"[ATTENTION] Aucun matériau importé pour {filename}")
+
     root_null = clean_usdz(doc)
+    print(f"[DIAG] {filename} : {count_texture_tags(doc)} tag(s) matériau après nettoyage")
 
     with NativeStdoutCapture() as cap:
         assets = []
@@ -313,6 +337,9 @@ def process_file(usdz_path, output_root, keep_open=False):
             doc, fbx_path, c4d.SAVEDOCUMENTFLAGS_DONTADDTORECENTLIST, FBX_EXPORT_ID
         )
 
+    print(f"[DIAG] {filename} : {len(assets)} asset(s) collecté(s) par Save Project with Assets")
+    for a in assets:
+        print(f"  [ASSET] {a.get('filename', a) if isinstance(a, dict) else a}")
     if not ok_save:
         print(f"[ATTENTION] Echec sauvegarde projet pour {filename}")
     if missing_assets:
